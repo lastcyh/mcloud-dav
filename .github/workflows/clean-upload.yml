@@ -1,0 +1,40 @@
+name: clean-and-upload
+
+on:
+  schedule:
+    - cron: "20 2 * * *" # UTC 2:20 = 北京 10:20, 每天清洗并推送 catalog
+  workflow_dispatch: {} # 手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 清洗 data/ 下的链接文档
+        run: python clean_links.py
+
+      - name: 上传 catalog 到 Worker
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          DAV_USER: ${{ secrets.DAV_USER }}
+          DAV_PASS: ${{ secrets.DAV_PASS }}
+        run: python upload_catalog.py --url "$WORKER_URL" --user "$DAV_USER" --pass "$DAV_PASS"
+
+      - name: 提交清洗结果
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add shares_cleaned.yaml catalog.json out/ || true
+          git diff --cached --quiet || git commit -m "chore: 更新清洗结果 $(date -u +%F)"
+          git push

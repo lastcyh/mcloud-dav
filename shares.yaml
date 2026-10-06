@@ -1,0 +1,8 @@
+# 手动添加的零散分享（可选）。大批量请用 clean_links.py 清洗 data/ 下的合集文档。
+# link 支持: 完整链接 / 分享ID / ID#提取码 / 逗号分隔多个(一个挂载绑多条分享)
+mount_prefix: ""
+分类: {}
+# 示例:
+#   电影:
+#     - title: 某电影
+#       link: https://yun.139.com/shareweb/#/w/i/xxxxxxxx

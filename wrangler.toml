@@ -1,0 +1,10 @@
+name = "mcloud-dav"
+main = "worker/cloud139.js"
+compatibility_date = "2025-01-01"
+
+# 一键部署按钮会自动创建下面的 KV 并绑定; 手动部署时先执行:
+#   npx wrangler kv namespace create CACHE
+# 然后把返回的 id 填到下面
+[[kv_namespaces]]
+binding = "CACHE"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"

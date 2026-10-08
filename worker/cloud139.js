@@ -263,6 +263,16 @@ function parseMtime(s) {
   return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 8, +m[5], +m[6]); // 北京时间
 }
 
+// catalog.generated 的解析。带时区偏移/ Z 的按原样解析; 老版不带时区的裸本地时间
+// 若直接 Date.parse 会被当成 UTC → 目录 mtime 差 8 小时(北京时区下显示成未来时间)。
+// 所以裸时间一律按 +08:00(本库固定北京时区)解释。
+function parseCatalogTime(s) {
+  const t = String(s || "").trim();
+  if (!t) return 0;
+  if (/(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(t)) return Date.parse(t) || 0;
+  return Date.parse(t.replace(" ", "T") + "+08:00") || 0;
+}
+
 const MEMO_MAX = 300;        // 内存目录缓存条数上限(超过按 LRU 淘汰, 防止 isolate 无限膨胀)
 
 function memoSet(key, data, ts) {
@@ -485,7 +495,7 @@ async function resolvePath(env, tree, segs, ctx) {
 
 async function dirEntries(env, resolved, ctx, cat) {
   if (resolved.kind === "catdir") {
-    const mt = Date.parse(cat?.generated || "") || Date.now();
+    const mt = parseCatalogTime(cat?.generated) || Date.now();
     return [...resolved.node.children.values()].map(n => ({
       kind: "dir", name: n.name, size: 0, mtime: mt, virtual: true,
     }));
@@ -551,7 +561,7 @@ async function handleDav(request, env, url, ctx) {
     if (!resolved) return text("404 Not Found", 404);
 
     // 目录 mtime = catalog 重建时间 与 内容最新修改时间 的较大者
-    let selfMtime = Date.parse(cat.generated || "") || Date.now();
+    let selfMtime = parseCatalogTime(cat.generated) || Date.now();
     let entries = [];
     // 文件没有子项, 直接返回自身(省掉一次拿文件 ID 当目录去列的 139 调用)
     // Depth:0 只要资源自身属性, 别为它去把整个目录拉一遍(白耗 139 配额)
@@ -906,7 +916,9 @@ async function handleCatalogLines(request, env) {
   if (!Object.keys(mounts).length) return json({ error: "没有解析到有效条目, 格式: 路径 | 链接" }, 400);
   const err = catalogError(mounts);
   if (err) return json({ error: err }, 400);
-  const catalog = { version: 1, generated: new Date().toISOString().slice(0, 19), mounts: mounts };
+  // 与 clean_links.py 对齐: 带 +08:00 偏移, 别用 toISOString().slice(0,19)(那会丢掉 Z 变裸时间)
+  const generated = new Date(Date.now() + 8 * 3600e3).toISOString().replace(/\.\d+Z$/, "+08:00");
+  const catalog = { version: 1, generated: generated, mounts: mounts };
   await env.CACHE.put("catalog", JSON.stringify(catalog));
   globalThis.__cat = null;
   return json({ ok: true, mounts: Object.keys(mounts).length });

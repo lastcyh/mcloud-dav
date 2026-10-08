@@ -159,7 +159,10 @@ def clean(files):
         print("  · 要批量导入: 把链接文档放进 data/, 格式参考 data/示例合集.md")
         return 0
 
-    catalog = {"version": 1, "generated": datetime.now().isoformat(timespec="seconds"),
+    # generated 必须带明确时区偏移。不带时区的话, Worker 端 Date.parse 会按 UTC 解析,
+    # 目录的"最后修改时间"就会差 8 小时(北京时区下显示成未来时间), 而且 Actions(UTC)
+    # 与本地(北京)跑出来的含义还不一致。
+    catalog = {"version": 1, "generated": datetime.now().astimezone().isoformat(timespec="seconds"),
                "mounts": mounts}
     with open("catalog.json", "w", encoding="utf-8") as fp:
         json.dump(catalog, fp, ensure_ascii=False, indent=1)

@@ -49,6 +49,9 @@ def main():
     except json.JSONDecodeError as e:
         return fail(f"{args.file} 不是合法 JSON: {e}")
 
+    if not isinstance(catalog, dict):
+        return fail(f"{args.file} 顶层必须是 JSON 对象（形如 {{\"mounts\": {{...}}}}）")
+
     mounts = catalog.get("mounts") or {}
     if not mounts:
         return fail(f"{args.file} 里没有 mounts，检查清洗结果")
@@ -65,8 +68,10 @@ def main():
         return fail(f"上传失败 HTTP {r.status_code}: {r.text[:200]}")
 
     try:
-        info = r.json() or {}
+        info = r.json()
     except ValueError:
+        return fail(f"上传返回了非 JSON 内容 (HTTP {r.status_code}): {r.text[:200]}")
+    if not isinstance(info, dict):
         info = {}
     print(f"上传成功: {info.get('mounts', len(mounts))} 个挂载 -> {target}")
     return 0

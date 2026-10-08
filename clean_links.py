@@ -6,7 +6,8 @@
   - "# / ## / ###" 标题行 -> 目录层级
   - 普通行: 行内文字清理后作为标题, 行内所有 139 链接绑定到该挂载
   - 标题自动去掉画质 / 集数等噪音
-  - 全文档按分享 ID 去重
+  - 每个文档内按分享 ID 去重；同一分享要挂到多个目录时，在文档里写成多行
+    （跨文件不去重，所以放两个文件里会得到两个挂载）
 
 用法:
     python clean_links.py                # 处理 data/ 下所有 .md / .txt / .docx
@@ -59,14 +60,13 @@ def extract_ids(line):
             if sid in seen:
                 continue
             seen.add(sid)
-            # 链接后面可能跟 #提取码。139 链接本身含 "#"(shareweb/#/w/i/...)，
-            # 所以只能看 ID 之后的部分；再用"不含 / : ? 且不长"筛掉误判
-            # (markdown 的 [链接](链接) 写法会让后面跟着另一半 URL)
-            rest = line[m.end():]
+            # 提取码必须紧跟在 ID 后面（允许前置空格）。不能在整个剩余串里找 "#"：
+            # 139 链接本身含 "#"（shareweb/#/w/i/...），同一行后面的另一个链接也带 "#"，
+            # markdown 的 [链接](链接) 后半段同样是 URL
+            rest = line[m.end():].lstrip()
             pwd = ""
-            h = rest.find("#")
-            if h >= 0:
-                cand = re.split(r"[,，;；\s)\]]", rest[h + 1:], maxsplit=1)[0].strip()
+            if rest.startswith("#"):
+                cand = re.split(r"[,，;；\s)\]]", rest[1:], maxsplit=1)[0].strip()
                 if cand and len(cand) <= 32 and not re.search(r"[/:?]", cand):
                     pwd = cand
             out.append(f"{sid}#{pwd}" if pwd else sid)
@@ -110,14 +110,15 @@ def iter_lines(path):
 
 
 def parse_file(path):
-    """返回按文档顺序的 {路径段, 标题, 链接ID列表} 列表"""
+    """返回按文档顺序的 {路径段, 标题, 链接ID列表} 列表（按分享 ID 在本文件内去重）"""
     items, seen = [], set()
-    headings = []
+    headings = []   # [(级别, 标题)] —— 用栈处理跳级标题
     for line in iter_lines(path):
         h = re.match(r"^(#{1,6})\s+(.*)", line)
         if h:
             level, text = len(h.group(1)), h.group(2).strip()
-            headings = headings[: level - 1] + [text]
+            # 弹掉同级或更深的标题: "# A → ### B → ### C" 应该是 A/C, 不是 A/B/C
+            headings = [x for x in headings if x[0] < level] + [(level, text)]
             continue
         ids = [i for i in extract_ids(line) if not DEMO_RE.match(i)]
         if not ids:
@@ -129,7 +130,7 @@ def parse_file(path):
         raw = re.sub(r"https?://\S+", "", line)
         raw = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", raw).strip()
         title = clean_title(re.sub(r"^\d+[.、]\s*", "", raw)) or new_ids[0]
-        items.append({"path": [h for h in headings if h], "title": title, "ids": new_ids})
+        items.append({"path": [t for _, t in headings], "title": title, "ids": new_ids})
     return items
 
 

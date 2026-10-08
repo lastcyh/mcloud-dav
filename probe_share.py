@@ -64,14 +64,27 @@ def decrypt_payload(text):
     return json.loads(data[:-pad].decode("utf-8", "replace"))
 
 
+ID_RE = re.compile(
+    r"(?:shareweb|w)/#/(?:w/i|share)/([0-9A-Za-z]+)"          # yun.139.com/shareweb/#/w/i/ID, /w/#/share/ID
+    r"|caiyun\.139\.com/[wm]/i[/?]([0-9A-Za-z]+)"             # caiyun.139.com/m/i?ID
+)
+
+
 def parse_link(link):
-    m = re.search(r"(?:shareweb/#|w/#)/w/i/([0-9A-Za-z]+)", link) or \
-        re.search(r"caiyun\.139\.com/[wm]/i[/?]([0-9A-Za-z]+)", link)
-    lid = m.group(1) if m else link.strip()
-    pwd = ""
-    if "#" in lid:
-        lid, pwd = lid.split("#", 1)
-    return lid.strip(), pwd.strip()
+    """完整链接 / 裸 ID / ID#提取码 都支持；完整链接尾部跟 #提取码 也认"""
+    s = link.strip()
+    m = ID_RE.search(s)
+    if m:
+        lid = m.group(1) or m.group(2)
+        rest = s[m.end():].lstrip()
+        pwd = ""
+        if rest.startswith("#"):
+            pwd = re.split(r"[,，;；\s]", rest[1:], maxsplit=1)[0].strip()
+        return lid, pwd
+    if "#" in s:                      # 裸 ID#提取码
+        lid, pwd = s.split("#", 1)
+        return lid.strip(), pwd.strip()
+    return s, ""
 
 
 def post(url, body, auth):

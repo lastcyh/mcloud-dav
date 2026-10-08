@@ -31,13 +31,13 @@ const HEADERS = {
   "Origin": "https://yun.139.com",
   "Referer": "https://yun.139.com/",
 };
-const DIR_FRESH = 1800;      // 目录新鲜期 30 分钟, 过期后先返回旧数据再后台刷新 (SWR)
-const DIR_STORE = 7 * 86400; // 目录缓存保留 7 天 (KV TTL)
-const DL_TTL = 600;          // 直链缓存 10 分钟（S3 预签名 15 分钟有效）
+const DIR_FRESH = 1800;      // 目录新鲜期 30 分钟【秒】—— 比较时 *1000 转毫秒
+const DIR_STORE = 7 * 86400; // 目录缓存保留 7 天【秒】(KV TTL 也是秒)
+const DL_TTL = 600;          // 直链缓存 10 分钟【秒】（S3 预签名 15 分钟有效）
 const BF_MAX = 5;            // 连续失败 N 次锁定
-const BF_WINDOW = 600e3;     // 失败计数窗口 10 分钟
-const BF_LOCK_TTL = 900e3;   // 锁定 15 分钟(内存级, 个人使用的轻量防护)
-const CAT_TTL = 60;          // catalog 内存缓存 60 秒(改完目录最长 1 分钟生效)
+const BF_WINDOW = 600e3;     // 失败计数窗口 10 分钟【毫秒】
+const BF_LOCK_TTL = 900e3;   // 锁定 15 分钟【毫秒】(内存级, 个人使用的轻量防护)
+const CAT_TTL = 60;          // catalog 内存缓存 60 秒【秒】—— 比较时 *1000 转毫秒
 const LIST_PAGE = 200;       // 139 分享列表单页条数(接口默认只给 100, 必须显式翻页)
 const LIST_MAX_PAGES = 100;  // 翻页安全上限: 100 页 × 200 = 20000 项
 const CACHE_V = "v2";        // 目录缓存键版本; 列目录结构变更时递增, 让旧缓存立即失效
@@ -121,9 +121,10 @@ class Err139 extends Error {
 
 async function call139(env, url, body) {
   // 9530 = 个别出口 IP 被 139 风控, 换个出口重试即可; 其他错误码直接抛
-  globalThis.__callCount = (globalThis.__callCount || 0) + 1;
   let last;
   for (let i = 0; i < 3; i++) {
+    // 按"实际发出的网络请求"计数(重试也算), 预热预算才是硬上限
+    globalThis.__callCount = (globalThis.__callCount || 0) + 1;
     try {
       const r = await fetch(url, {
         method: "POST",
@@ -194,7 +195,7 @@ async function getAuth(env) {
 
 async function getCatalog(env) {
   const now = Date.now();
-  if (globalThis.__cat && now - globalThis.__cat.ts < CAT_TTL) return globalThis.__cat.data;
+  if (globalThis.__cat && now - globalThis.__cat.ts < CAT_TTL * 1000) return globalThis.__cat.data;
   let data = null;
   try {
     const kv = await env.CACHE.get("catalog");
@@ -224,6 +225,35 @@ function buildTree(catalog) {
   return root;
 }
 
+// 校验目录结构。返回错误说明, 没问题返回 null。
+// 关键点: 路径不能互为前缀 —— catalog 里同时有 A 和 A/B 时, 走到 A 就被当成分享根,
+// A/B 永远访问不到(而且不报错, 很难查)。宁可导入时直接拒绝。
+function catalogError(mounts) {
+  if (!mounts || typeof mounts !== "object" || Array.isArray(mounts)) return "catalog.mounts 必须是对象";
+  const paths = Object.keys(mounts);
+  if (!paths.length) return "catalog.mounts 不能为空";
+  for (const p of paths) {
+    if (!p.trim() || p.startsWith("/") || p.endsWith("/")) return `路径格式不对: ${p}`;
+    const leaf = mounts[p];
+    if (!leaf || typeof leaf !== "object" || Array.isArray(leaf)) return `挂载内容必须是对象: ${p}`;
+    const ids = String(leaf.id || "").split(/[,，;；\n]+/).map(s => s.trim()).filter(Boolean);
+    if (!ids.length) return `挂载缺少 id: ${p}`;
+    for (const one of ids) {
+      const sid = one.split("#")[0].trim();
+      if (!sid || /[\/\s]/.test(sid)) return `分享 ID 不合法: ${p} -> ${one}`;
+    }
+  }
+  const set = new Set(paths);
+  for (const p of paths) {
+    const segs = p.split("/");
+    for (let i = 1; i < segs.length; i++) {
+      const parent = segs.slice(0, i).join("/");
+      if (set.has(parent)) return `路径冲突: "${parent}" 和 "${p}" 不能同时作为挂载(前者会遮住后者)`;
+    }
+  }
+  return null;
+}
+
 // ================= 列目录（带缓存） =================
 
 function parseMtime(s) {
@@ -234,10 +264,12 @@ function parseMtime(s) {
 
 const MEMO_MAX = 300;        // 内存目录缓存条数上限(超过按 LRU 淘汰, 防止 isolate 无限膨胀)
 
-function memoSet(key, data) {
+function memoSet(key, data, ts) {
   const m = (globalThis.__dirs ||= new Map());
   m.delete(key);                                   // 重新插入到末尾, 顺带实现 LRU
-  m.set(key, { data, ts: Date.now() });
+  // ts 用数据的原始时间(KV 里存的那个), 不能一律用"现在",
+  // 否则从 KV 捞出来的旧数据会被当成刚更新过, 新鲜期与保留期都算错
+  m.set(key, { data, ts: ts || Date.now() });
   while (m.size > MEMO_MAX) m.delete(m.keys().next().value);
 }
 
@@ -245,18 +277,25 @@ function memoSet(key, data) {
 // 最长保留 7 天, 超龄才同步重新拉取
 async function cachedListing(env, key, recompute, ctx, opts = {}) {
   const now = Date.now();
-  // 写回: 内存 memo 和 KV 都要更新。
-  // 只写 memo 不写 KV 的话, KV 里的 t 永远不变, 冷启动会一直读到旧数据(最长 DIR_STORE),
-  // 而且每个超过新鲜期的请求都会再触发一次全量重拉, 白白消耗 139 配额。
-  const store = () => recompute().then(async d => {
-    memoSet(key, d);
-    await env.CACHE.put(key, JSON.stringify({ d, t: Date.now() }), { expirationTtl: DIR_STORE });
-    return d;
-  });
+  // 同一目录的并发拉取合并成一次(冷加载和后台刷新共用), 避免重复打 139。
+  // 写回时内存 memo 和 KV 都要更新: 只写 memo 的话 KV 里的 t 永远不变,
+  // 冷启动会一直读到旧数据, 而且每个请求都会再触发一次全量重拉。
+  const inflight = (globalThis.__inflight ||= new Map());
+  const store = () => {
+    if (inflight.has(key)) return inflight.get(key);
+    const p = recompute().then(async d => {
+      const t = Date.now();
+      memoSet(key, d, t);
+      await env.CACHE.put(key, JSON.stringify({ d, t }), { expirationTtl: DIR_STORE });
+      return d;
+    }).finally(() => inflight.delete(key));
+    inflight.set(key, p);
+    return p;
+  };
   const refresh = () => store().catch(() => {});
   const memo = globalThis.__dirs?.get(key);
   if (memo && now - memo.ts < DIR_STORE * 1000) {
-    if (!opts.fillOnly && now - memo.ts > DIR_FRESH && ctx?.waitUntil) ctx.waitUntil(refresh());
+    if (!opts.fillOnly && now - memo.ts > DIR_FRESH * 1000 && ctx?.waitUntil) ctx.waitUntil(refresh());
     return memo.data;
   }
   const kv = await env.CACHE.get(key);
@@ -264,29 +303,40 @@ async function cachedListing(env, key, recompute, ctx, opts = {}) {
     try {
       const j = JSON.parse(kv);
       if (j && j.d && now - (j.t || 0) < DIR_STORE * 1000) {
-        memoSet(key, j.d);
-        if (!opts.fillOnly && now - (j.t || 0) > DIR_FRESH && ctx?.waitUntil) ctx.waitUntil(refresh());
+        memoSet(key, j.d, j.t);   // 保留原始时间, 别让旧数据"变新鲜"
+        if (!opts.fillOnly && now - (j.t || 0) > DIR_FRESH * 1000 && ctx?.waitUntil) ctx.waitUntil(refresh());
         return j.d;
       }
     } catch {}
   }
-  // 同一目录的并发请求合并成一次拉取, 避免重复打 139
-  const inflight = (globalThis.__inflight ||= new Map());
-  if (inflight.has(key)) return inflight.get(key);
-  const p = store().finally(() => inflight.delete(key));
-  inflight.set(key, p);
-  return p;
+  return store();
+}
+
+// 同一目录里文件夹与文件重名时, 给文件加后缀 —— 否则 PROPFIND 会输出两个相同 href,
+// 而 resolvePath 按名字查找只认文件夹, 同名文件永远访问不到。
+function uniqueNames(folders, files) {
+  const used = new Set();
+  for (const arr of [folders, files]) for (const e of arr) {
+    let name = e.name, n = 2;
+    while (used.has(name)) name = `${e.name} (${n++})`;
+    used.add(name);
+    e.name = name;
+  }
 }
 
 // 列一个分享目录的全部内容。
 // 139 getOutLinkInfoV6 不传分页参数时只返回前 100 项(按最近添加排序),
 // 因此必须用 bNum/eNum 逐页拉取(单页上限 200), 并用 caSrt/coSrt/srtDr 固定排序保证翻页稳定。
-async function listAll(env, member, pcaid) {
+// budget: 预热时的调用预算; 用满就抛错(不把残缺结果当完整目录缓存)
+async function listAll(env, member, pcaid, budget) {
   const account = (await getConfig(env)).account;
   const folders = [];
   const files = [];
   const seen = new Set();
   for (let page = 0; page < LIST_MAX_PAGES; page++) {
+    if (budget && (globalThis.__callCount || 0) >= budget) {
+      throw new Err139("BUDGET", "预热调用预算已用完, 本轮跳过该挂载");
+    }
     const bNum = page * LIST_PAGE + 1;
     const body = await call139(env, API.LIST, {
       getOutLinkInfoReq: {
@@ -312,12 +362,13 @@ async function listAll(env, member, pcaid) {
     // 本页不足一页(或没有新条目) => 已到最后一页
     if (ca.length + co.length < LIST_PAGE || fresh === 0) break;
   }
+  uniqueNames(folders, files);
   return { folders, files };
 }
 
 async function listOne(env, member, pcaid, ctx, opts = {}) {
   return cachedListing(env, `lst:${CACHE_V}:${member.id}:${member.pwd}:${pcaid}`,
-    async () => listAll(env, member, pcaid), ctx, opts);
+    async () => listAll(env, member, pcaid, opts.budget), ctx, opts);
 }
 
 // 列单个成员的"有效根": 若根目录只有一个文件夹(分享者套壳)则自动下沉, 最多 3 层
@@ -358,6 +409,7 @@ async function listMountRoot(env, members, ctx, opts = {}) {
       }
     }
     if (!okCount && firstErr) throw firstErr;   // 全都失败才整体报错, 免得掩盖问题
+    uniqueNames(merged.folders, merged.files);  // 多分享合并后也保证名字唯一
     return merged;
   }, ctx, opts);
 }
@@ -385,30 +437,41 @@ async function getDlUrl(env, members, entry) {
 // 返回 {kind:"catdir",node} | {kind:"mountdir",members} |
 //       {kind:"shareDir",entry,members} | {kind:"file",entry,members} | null
 async function resolvePath(env, tree, segs, ctx) {
+  // 边走边记住"最近一个有挂载的祖先"。
+  // 这样 catalog 里同时有 A 和 A/B 时, 请求 A/B 会先匹配到子节点 B(用 B 的挂载),
+  // 而不是走到 A 就把剩下的 B 当成分享内部路径。
   let node = tree;
   let i = 0;
-  while (i < segs.length && !node.leaf) {
+  let best = null, bestAt = 0;
+  while (i < segs.length) {
+    if (node.leaf) { best = node; bestAt = i; }
     const next = node.children.get(segs[i]);
-    if (!next) return null;
+    if (!next) break;
     node = next;
     i++;
   }
-  if (!node.leaf) {
-    if (i < segs.length) return null;
-    return { kind: "catdir", node };
-  }
-  const members = parseMembers(node.leaf);
+  let leaf, rest;
+  if (i === segs.length && node.leaf) { leaf = node; rest = []; }
+  else if (best) { leaf = best; rest = segs.slice(bestAt); }
+  else if (i === segs.length) return { kind: "catdir", node };
+  else return null;
+  const members = parseMembers(leaf.leaf);
   if (!members.length) return null;
-  const rest = segs.slice(i);
   if (rest.length === 0) return { kind: "mountdir", members };
   let entries = await listMountRoot(env, members, ctx);
+  // 多分享挂载时, 要一路记住当前条目来自哪条分享:
+  // 只有挂载根那一层带 memberIdx, 往下 listOne 出来的条目没有,
+  // 所以必须把上一层的来源带下去, 否则深一层就会错用 members[0]。
+  let mi = 0;
   for (let j = 0; j < rest.length; j++) {
     const e = entries.folders.concat(entries.files).find(x => x.name === rest[j]);
     if (!e) return null;
+    if (e.memberIdx != null) mi = e.memberIdx;
     if (j === rest.length - 1) {
-      return e.kind === "dir" ? { kind: "shareDir", entry: e, members } : { kind: "file", entry: e, members };
+      const entry = { ...e, memberIdx: mi };
+      return e.kind === "dir" ? { kind: "shareDir", entry, members } : { kind: "file", entry, members };
     }
-    entries = await listOne(env, members[e.memberIdx || 0], e.id, ctx);
+    entries = await listOne(env, members[mi], e.id, ctx);
   }
   return null;
 }
@@ -543,19 +606,26 @@ async function checkAuth(request, env) {
   const now = Date.now();
   if (bf.size > 500) for (const [k, v] of bf) if (now - (v.t || 0) > BF_WINDOW) bf.delete(k);
   let e = bf.get(ip);
-  if (!e || now - (e.t || 0) > BF_WINDOW) { e = { n: 0, t: now }; bf.set(ip, e); }
-  if (e.locked && now < e.locked) return false;
-  if (e.locked) { e.n = 0; e.locked = 0; }
+  if (!e) { e = { n: 0, t: now }; bf.set(ip, e); }
+  if (e.locked && now < e.locked) return false;                    // 锁定中, 直接拒
+  if (e.locked) { e.locked = 0; e.n = 0; e.t = now; }              // 锁已过期, 重置计数
+  if (now - (e.t || 0) > BF_WINDOW) { e.n = 0; e.t = now; }        // 计数窗口过期
   const c = await getDavCreds(env);
   if (!c.user || !c.pass) return false;
   const h = request.headers.get("Authorization") || "";
   let ok = false;
   if (h.startsWith("Basic ")) {
-    let raw = null;
-    try { raw = atob(h.slice(5)); } catch {}
-    if (raw !== null) {
-      const i = raw.indexOf(":");   // 按第一个冒号切分, 密码里含冒号也能正确比对
-      ok = i >= 0 && raw.slice(0, i) === c.user && raw.slice(i + 1) === c.pass;
+    let bin = null;
+    try { bin = atob(h.slice(5)); } catch {}
+    if (bin !== null) {
+      // 客户端发的可能是 UTF-8 字节, atob 出来是 latin1 字符串, 中文账号密码会比对失败;
+      // 两种解释都试一下(纯 ASCII 时两者相同)
+      const cands = [bin];
+      try { cands.push(new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0)))); } catch {}
+      for (const raw of cands) {
+        const i = raw.indexOf(":");   // 按第一个冒号切分, 密码里含冒号也能正确比对
+        if (i >= 0 && raw.slice(0, i) === c.user && raw.slice(i + 1) === c.pass) { ok = true; break; }
+      }
     }
   }
   if (ok) { bf.delete(ip); return true; }
@@ -563,7 +633,7 @@ async function checkAuth(request, env) {
   e.n = (e.n || 0) + 1;
   await sleep(400 + Math.floor(Math.random() * 600));
   if (e.n >= BF_MAX) {
-    e.locked = now + BF_LOCK_TTL * 1000;
+    e.locked = now + BF_LOCK_TTL;   // BF_LOCK_TTL 本身就是毫秒
   }
   return false;
 }
@@ -608,23 +678,20 @@ async function handleApi(request, env, url, ctx) {
   if (path === "/admin/catalog" && request.method === "POST") {
     let data;
     try { data = await request.json(); } catch { return text("bad json", 400); }
-    if (!data || typeof data.mounts !== "object" || !Object.keys(data.mounts).length) {
-      return text("catalog.mounts 不能为空", 400);
-    }
+    const err = catalogError(data && data.mounts);
+    if (err) return text(err, 400);
     await env.CACHE.put("catalog", JSON.stringify(data));
     globalThis.__cat = null;
     return json({ ok: true, mounts: Object.keys(data.mounts).length, generated: data.generated || null });
   }
 
   if (path === "/probe") {
-    const raw = url.searchParams.get("link") || "";
-    let lid = raw, pwd = "";
-    const m = raw.match(/(?:shareweb\/#|w\/#)\/w\/i\/([0-9A-Za-z]+)/) || raw.match(/caiyun\.139\.com\/[wm]\/i[/?]([0-9A-Za-z]+)/);
-    if (m) lid = m[1];
+    const parsed = parseLinkEntriesInWorker(url.searchParams.get("link") || "")[0] || "";
+    let lid = parsed, pwd = "";
     if (lid.includes("#")) [lid, pwd] = lid.split("#", 2);
     const t0 = Date.now();
     const d = await listAll(env, { id: lid, pwd }, "root");
-    return json({ share: lid, ms: Date.now() - t0, folders: d.folders.map(f => f.name), files: d.files.map(f => f.name) });
+    return json({ share: lid, pw: pwd ? "有" : "无", ms: Date.now() - t0, folders: d.folders.map(f => f.name), files: d.files.map(f => f.name) });
   }
 
   return text("404 Not Found. /health /link /tree /admin/catalog /probe", 404);
@@ -728,21 +795,19 @@ b2.onclick = async () => {
 
 function parseLinkEntriesInWorker(raw) {
   return String(raw || "").split(/[,，;；\n]+/).map(s => s.trim()).filter(Boolean).map(s => {
-    const m = s.match(/(?:shareweb\/#|w\/#)\/w\/i\/([0-9A-Za-z]+)/) || s.match(/caiyun\.139\.com\/[wm]\/i[/?]([0-9A-Za-z]+)/);
+    const m = s.match(/(?:shareweb|w)\/#\/(?:w\/i|share)\/([0-9A-Za-z]+)/) || s.match(/caiyun\.139\.com\/[wm]\/i[/?]([0-9A-Za-z]+)/);
     let id, pwd = "";
     if (m) {
       id = m[1];
-      // 链接后面跟 #提取码 也要认。注意 139 链接本身含 "#"(shareweb/#/w/i/...),
-      // 所以只能看 ID 之后的部分, 不能对整串 split("#")
-      const rest = s.slice(m.index + m[0].length);
-      const h = rest.indexOf("#");
-      if (h >= 0) {
-        // 候选码不能含 / : ? 且不能太长——否则是 markdown [链接](链接) 的后半段 URL
-        const cand = rest.slice(h + 1).split(/[,，;；\s)\]]/)[0].trim();
+      // 提取码必须紧跟在 ID 后面(允许前置空格)。不能在整个剩余串里找 "#":
+      // 139 链接本身就含 "#"(shareweb/#/w/i/...), markdown 的 [链接](链接) 后半段也是 URL
+      const rest = s.slice(m.index + m[0].length).replace(/^\s+/, "");
+      if (rest.startsWith("#")) {
+        const cand = rest.slice(1).split(/[,，;；\s)\]]/)[0].trim();
         if (cand && cand.length <= 32 && !/[/:?]/.test(cand)) pwd = cand;
       }
-    } else if (s.includes("#")) {
-      const p = s.split("#");
+    } else if (!/^https?:/i.test(s) && s.includes("#")) {
+      const p = s.split("#");      // 裸 ID#提取码(不是完整链接才走这里)
       id = p[0].trim(); pwd = (p[1] || "").trim();
     } else {
       id = s;
@@ -776,15 +841,21 @@ async function handleSetup(request, env, url) {
     if (!account) account = parts[1] || "";
     if (!/^\d{5,15}$/.test(account)) return json({ error: "账号识别失败, 请手动填写手机号" }, 400);
     const old = await getConfig(env);
-    // 留空 = 不修改(管理页就是这么标注的); 首次配置必须填
+    // 留空 = 不修改(管理页就是这么标注的); 首次配置必须填。
+    // 长度只校验"新填的"密码 —— 沿用的旧密码可能是环境变量配的短密码, 不该拦
     let dav_pass = String(b.dav_pass || "");
-    if (!dav_pass) {
+    if (dav_pass) {
+      if (dav_pass.length < 6) return json({ error: "WebDAV 密码至少 6 位" }, 400);
+    } else {
       if (!configured || !old.dav_pass) return json({ error: "WebDAV 密码至少 6 位" }, 400);
       dav_pass = old.dav_pass;
     }
-    if (dav_pass.length < 6) return json({ error: "WebDAV 密码至少 6 位" }, 400);
     const dav_user = String(b.dav_user || old.dav_user || "admin").trim() || "admin";
+    if (dav_user.includes(":")) return json({ error: "WebDAV 用户名不能包含冒号" }, 400);
     await env.CACHE.put("config", JSON.stringify({ auth: auth, account: account, dav_user: dav_user, dav_pass: dav_pass }));
+    // KV 里的 auth 优先级高于 config, 不覆盖的话粘贴新令牌后仍在用旧令牌
+    await env.CACHE.put("auth", auth);
+    await env.CACHE.put("auth_check", "0");   // 重置检查时间, 让续期逻辑重新评估新令牌
     globalThis.__cfg = null;
     globalThis.__auth = null;   // 令牌可能变了, 让 getAuth 重新读
     return json({ ok: true });
@@ -821,6 +892,8 @@ async function handleCatalogLines(request, env) {
     mounts[path] = { id: ids.join(",") };
   }
   if (!Object.keys(mounts).length) return json({ error: "没有解析到有效条目, 格式: 路径 | 链接" }, 400);
+  const err = catalogError(mounts);
+  if (err) return json({ error: err }, 400);
   const catalog = { version: 1, generated: new Date().toISOString().slice(0, 19), mounts: mounts };
   await env.CACHE.put("catalog", JSON.stringify(catalog));
   globalThis.__cat = null;
@@ -842,7 +915,8 @@ async function warmMounts(env, ctx) {
   for (; idx < keys.length && n < WARM_BATCH; idx++, n++) {
     const members = parseMembers(cat.mounts[keys[idx]]);
     if (!members.length) continue;
-    try { await listMountRoot(env, members, ctx, { fillOnly: true }); } catch {}
+    // 预算透传给 listAll, 翻页过程中就会停(不会先打完 100 次再检查)
+    try { await listMountRoot(env, members, ctx, { fillOnly: true, budget: WARM_CALL_BUDGET }); } catch {}
     if (globalThis.__callCount >= WARM_CALL_BUDGET) { idx++; break; }
   }
   await env.CACHE.put("warm_idx", String(idx >= keys.length ? 0 : idx));
@@ -859,12 +933,14 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     try {
-      if (url.pathname === "/setup") return handleSetup(request, env, url);
-      if (url.pathname === "/admin") return handleAdminUi(request, env, url);
+      // 必须 await: 不 await 的话处理器异步抛错会变成 rejected Promise,
+      // 这个 try/catch 根本接不住, 客户端拿到的是 500 而不是下面的 JSON
+      if (url.pathname === "/setup") return await handleSetup(request, env, url);
+      if (url.pathname === "/admin") return await handleAdminUi(request, env, url);
       if (API_PATHS.has(url.pathname) || url.pathname === "/link") {
-        return handleApi(request, env, url, ctx);
+        return await handleApi(request, env, url, ctx);
       }
-      return handleDav(request, env, url, ctx);
+      return await handleDav(request, env, url, ctx);
     } catch (e) {
       return json({ error: String(e).slice(0, 300), rc: e.rc || null }, 502);
     }

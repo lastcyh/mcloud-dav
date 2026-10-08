@@ -18,6 +18,7 @@
 import glob
 import html
 import json
+import os
 import re
 import sys
 from datetime import datetime
@@ -34,10 +35,14 @@ URL_PATTERNS = [
     re.compile(r"caiyun\.139\.com/[wm]/i[/?]([0-9A-Za-z]+)"),
 ]
 YEAR_RE = re.compile(r"[（(](\d{4})[）)]")
+# 画质 / 集数等噪音。只删掉词本身、保留其余内容，
+# 否则「4K修复版 某电影」这种前缀会被整条清空
 NOISE_RE = re.compile(
-    r"(4K|1080[Pp]|720[Pp]|HDR|DV|60[Ff][Pp][Ss]|高码|高码率|杜比|臻彩|内封|内嵌|简中|繁中|中英文字幕|"
-    r"官方中字|未删减|纯净版|多版本|SDR|HQ|WEB-?DL|BluRay|REMUX|全\d+集|\d+集全|更新至第?\d+集).*$"
+    r"(4K|1080[Pp]|720[Pp]|HDR|DV|60[Ff][Pp][Ss]|高码率|高码|杜比|臻彩|内封|内嵌|简中|繁中|中英文字幕|"
+    r"官方中字|未删减|纯净版|多版本|SDR|HQ|WEB-?DL|BluRay|REMUX|全\d+集|\d+集全|更新至第?\d+集)"
 )
+# data/示例合集.md 里的演示 ID，永远不参与清洗（否则会把假挂载推上线，覆盖真实目录）
+DEMO_RE = re.compile(r"^ExampleID", re.I)
 BAD_CHARS = re.compile(r'[\\/:*?"<>|]')
 EMOJI_RE = re.compile(
     "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U0001F900-\U0001F9FF\u2B00-\u2BFF\uFE0F]+",
@@ -46,13 +51,26 @@ EMOJI_RE = re.compile(
 
 
 def extract_ids(line):
-    """行内所有 139 分享 ID, 按出现顺序去重"""
-    ids = []
+    """行内所有 139 分享，返回 ['分享ID'] 或 ['分享ID#提取码']（按分享 ID 去重）"""
+    out, seen = [], set()
     for pat in URL_PATTERNS:
         for m in pat.finditer(line):
-            if m.group(1) not in ids:
-                ids.append(m.group(1))
-    return ids
+            sid = m.group(1)
+            if sid in seen:
+                continue
+            seen.add(sid)
+            # 链接后面可能跟 #提取码。139 链接本身含 "#"(shareweb/#/w/i/...)，
+            # 所以只能看 ID 之后的部分；再用"不含 / : ? 且不长"筛掉误判
+            # (markdown 的 [链接](链接) 写法会让后面跟着另一半 URL)
+            rest = line[m.end():]
+            pwd = ""
+            h = rest.find("#")
+            if h >= 0:
+                cand = re.split(r"[,，;；\s)\]]", rest[h + 1:], maxsplit=1)[0].strip()
+                if cand and len(cand) <= 32 and not re.search(r"[/:?]", cand):
+                    pwd = cand
+            out.append(f"{sid}#{pwd}" if pwd else sid)
+    return out
 
 
 def clean_title(raw):
@@ -62,6 +80,9 @@ def clean_title(raw):
     t = re.sub(r"https?://\S+", "", t)
     t = re.sub(r"[\\[\]`#*_|]", "", t)
     t = html.unescape(t).strip().strip("｜|").strip()
+    no_noise = re.sub(r"\s{2,}", " ", NOISE_RE.sub(" ", t)).strip()
+    if no_noise:            # 万一整个标题都是噪音词，就保留原样
+        t = no_noise
     while True:
         t2 = re.sub(r"【[^【】]*】\s*$", "", t).strip().strip("：:").strip()
         if t2 == t:
@@ -98,13 +119,13 @@ def parse_file(path):
             level, text = len(h.group(1)), h.group(2).strip()
             headings = headings[: level - 1] + [text]
             continue
-        ids = extract_ids(line)
+        ids = [i for i in extract_ids(line) if not DEMO_RE.match(i)]
         if not ids:
             continue
-        new_ids = [i for i in ids if i not in seen]
+        new_ids = [i for i in ids if i.split("#")[0] not in seen]
         if not new_ids:
             continue
-        seen.update(new_ids)
+        seen.update(i.split("#")[0] for i in new_ids)
         raw = re.sub(r"https?://\S+", "", line)
         raw = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", raw).strip()
         title = clean_title(re.sub(r"^\d+[.、]\s*", "", raw)) or new_ids[0]
@@ -126,6 +147,16 @@ def clean(files):
                 key = f"{path} ({n})"
             used.add(key)
             mounts[key] = {"id": ",".join(item["ids"])}
+
+    if not mounts:
+        # 关键: 宁可什么都不做, 也不能拿"示例数据 / 空目录"去覆盖线上真实目录
+        # (POST /admin/catalog 是全量覆盖)
+        if os.path.exists("catalog.json"):
+            os.remove("catalog.json")
+        print("没有解析到有效分享链接 —— 未生成 catalog.json, 线上目录不会被改动。")
+        print("  · 只用 /admin 网页管目录: 可以删掉 .github/workflows/clean-upload.yml, 或忽略这一步")
+        print("  · 要批量导入: 把链接文档放进 data/, 格式参考 data/示例合集.md")
+        return 0
 
     catalog = {"version": 1, "generated": datetime.now().isoformat(timespec="seconds"),
                "mounts": mounts}

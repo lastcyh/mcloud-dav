@@ -37,11 +37,11 @@ const DL_TTL = 600;          // 直链缓存 10 分钟（S3 预签名 15 分钟�
 const BF_MAX = 5;            // 连续失败 N 次锁定
 const BF_WINDOW = 600e3;     // 失败计数窗口 10 分钟
 const BF_LOCK_TTL = 900e3;   // 锁定 15 分钟(内存级, 个人使用的轻量防护)
-const CAT_TTL = 600;         // catalog 内存缓存 10 分钟
+const CAT_TTL = 60;          // catalog 内存缓存 60 秒(改完目录最长 1 分钟生效)
 const LIST_PAGE = 200;       // 139 分享列表单页条数(接口默认只给 100, 必须显式翻页)
 const LIST_MAX_PAGES = 100;  // 翻页安全上限: 100 页 × 200 = 20000 项
 const CACHE_V = "v2";        // 目录缓存键版本; 列目录结构变更时递增, 让旧缓存立即失效
-const WARM_BATCH = 40;       // 每次定时预热处理的挂载数(只补缺, 已缓存的零成本跳过)
+const WARM_BATCH = 8;        // 每次定时预热处理的挂载数(只补缺; 免费版单次请求 50 子请求上限, 不宜调大)
 const WARM_CALL_BUDGET = 25; // 预热时 139 API 调用预算(免费版单次请求 50 子请求上限)
 const WARM_DAILY_CAP = 2000; // 每日预热调用上限(保护账号, 避免触发风控)
 
@@ -96,7 +96,8 @@ async function getConfig(env) {
     if (kv) v = JSON.parse(kv) || {};
   } catch {}
   v.account = v.account || env.ACCOUNT || "";
-  v.auth = v.auth || env.AUTH || "";
+  // env.AUTH 允许带 "Basic " 前缀(配置向导会自动去掉, 环境变量路径这里统一处理)
+  v.auth = String(v.auth || env.AUTH || "").trim().replace(/^Basic\s+/i, "");
   v.dav_user = v.dav_user || env.DAV_USER || "";
   v.dav_pass = v.dav_pass || env.DAV_PASS || "";
   globalThis.__cfg = { v, ts: Date.now() };
@@ -154,14 +155,18 @@ function authRemainMs(auth) {
 }
 
 async function getAuth(env) {
+  // 内存缓存 60 秒: 否则每次调 139 都要读 2 次 KV(auth + auth_check),
+  // 分页后一次列目录会放大成十几次无谓的 KV 读
+  if (globalThis.__auth && Date.now() - globalThis.__auth.ts < 60000) return globalThis.__auth.v;
   const kvAuth = await env.CACHE.get("auth");
-  const auth = kvAuth || (await getConfig(env)).auth;
+  let auth = kvAuth || (await getConfig(env)).auth;
   const now = Date.now();
+  const memo = () => { globalThis.__auth = { v: auth, ts: Date.now() }; return auth; };
   const lastCheck = Number((await env.CACHE.get("auth_check")) || 0);
-  if (now - lastCheck < 3600e3) return auth;            // 每小时检查一次
+  if (now - lastCheck < 3600e3) return memo();          // 每小时检查一次
   await env.CACHE.put("auth_check", String(now));
   const remain = authRemainMs(auth);
-  if (remain > 15 * 86400e3 || remain <= 0) return auth; // 剩余>15天才续, 过期了续不了
+  if (remain > 15 * 86400e3 || remain <= 0) return memo(); // 剩余>15天才续, 过期了续不了
   try {
     const dec = atob(auth);
     const account = dec.split(":")[1];
@@ -175,14 +180,14 @@ async function getAuth(env) {
     const ret = (xml.match(/<return>([^<]*)<\/return>/i) || [])[1];
     const newTok = (xml.match(/<token>([^<]*)<\/token>/i) || [])[1];
     if (ret === "0" && newTok) {
-      const newAuth = btoa(`pc:${account}:${newTok}`);
-      await env.CACHE.put("auth", newAuth);
+      auth = btoa(`pc:${account}:${newTok}`);
+      await env.CACHE.put("auth", auth);
       console.log("139 token 已自动续期");
     }
   } catch (e) {
     console.log("token 刷新失败(继续用旧token):", String(e).slice(0, 100));
   }
-  return (await env.CACHE.get("auth")) || auth;
+  return memo();
 }
 
 // ================= catalog 与目录树 =================
@@ -227,22 +232,28 @@ function parseMtime(s) {
   return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 8, +m[5], +m[6]); // 北京时间
 }
 
+const MEMO_MAX = 300;        // 内存目录缓存条数上限(超过按 LRU 淘汰, 防止 isolate 无限膨胀)
+
 function memoSet(key, data) {
-  globalThis.__dirs = globalThis.__dirs || new Map();
-  globalThis.__dirs.set(key, { data, ts: Date.now() });
+  const m = (globalThis.__dirs ||= new Map());
+  m.delete(key);                                   // 重新插入到末尾, 顺带实现 LRU
+  m.set(key, { data, ts: Date.now() });
+  while (m.size > MEMO_MAX) m.delete(m.keys().next().value);
 }
 
 // 目录列表缓存: 新鲜期内直接返回; 过了新鲜期先返回旧数据 + 后台静默刷新 (SWR);
 // 最长保留 7 天, 超龄才同步重新拉取
 async function cachedListing(env, key, recompute, ctx, opts = {}) {
   const now = Date.now();
-  // 后台静默刷新: 内存 memo 和 KV 都要更新。
+  // 写回: 内存 memo 和 KV 都要更新。
   // 只写 memo 不写 KV 的话, KV 里的 t 永远不变, 冷启动会一直读到旧数据(最长 DIR_STORE),
   // 而且每个超过新鲜期的请求都会再触发一次全量重拉, 白白消耗 139 配额。
-  const refresh = () => recompute().then(async d => {
+  const store = () => recompute().then(async d => {
     memoSet(key, d);
     await env.CACHE.put(key, JSON.stringify({ d, t: Date.now() }), { expirationTtl: DIR_STORE });
-  }).catch(() => {});
+    return d;
+  });
+  const refresh = () => store().catch(() => {});
   const memo = globalThis.__dirs?.get(key);
   if (memo && now - memo.ts < DIR_STORE * 1000) {
     if (!opts.fillOnly && now - memo.ts > DIR_FRESH && ctx?.waitUntil) ctx.waitUntil(refresh());
@@ -259,10 +270,12 @@ async function cachedListing(env, key, recompute, ctx, opts = {}) {
       }
     } catch {}
   }
-  const d = await recompute();
-  memoSet(key, d);
-  await env.CACHE.put(key, JSON.stringify({ d, t: Date.now() }), { expirationTtl: DIR_STORE });
-  return d;
+  // 同一目录的并发请求合并成一次拉取, 避免重复打 139
+  const inflight = (globalThis.__inflight ||= new Map());
+  if (inflight.has(key)) return inflight.get(key);
+  const p = store().finally(() => inflight.delete(key));
+  inflight.set(key, p);
+  return p;
 }
 
 // 列一个分享目录的全部内容。
@@ -323,8 +336,18 @@ async function listMountRoot(env, members, ctx, opts = {}) {
   return cachedListing(env, key, async () => {
     const merged = { folders: [], files: [] };
     const seen = new Set();
+    let okCount = 0, firstErr = null;
     for (let mi = 0; mi < members.length; mi++) {
-      const one = await listMemberRoot(env, members[mi], ctx, opts);
+      let one;
+      try {
+        one = await listMemberRoot(env, members[mi], ctx, opts);
+      } catch (e) {
+        // 单条分享失效(过期/缺提取码)不该拖垮整个目录, 跳过它继续
+        if (!firstErr) firstErr = e;
+        console.log("挂载成员拉取失败, 已跳过:", String(e).slice(0, 120));
+        continue;
+      }
+      okCount++;
       for (const arr of [one.folders, one.files]) {
         for (const e of arr) {
           const k = e.kind + ":" + e.name;   // 按 类型+名字 去重, 避免同名文件与文件夹互相顶掉
@@ -334,6 +357,7 @@ async function listMountRoot(env, members, ctx, opts = {}) {
         }
       }
     }
+    if (!okCount && firstErr) throw firstErr;   // 全都失败才整体报错, 免得掩盖问题
     return merged;
   }, ctx, opts);
 }
@@ -517,6 +541,7 @@ async function checkAuth(request, env) {
   const ip = request.headers.get("CF-Connecting-IP") || "unknown";
   const bf = (globalThis.__bf ||= new Map());
   const now = Date.now();
+  if (bf.size > 500) for (const [k, v] of bf) if (now - (v.t || 0) > BF_WINDOW) bf.delete(k);
   let e = bf.get(ip);
   if (!e || now - (e.t || 0) > BF_WINDOW) { e = { n: 0, t: now }; bf.set(ip, e); }
   if (e.locked && now < e.locked) return false;
@@ -526,9 +551,12 @@ async function checkAuth(request, env) {
   const h = request.headers.get("Authorization") || "";
   let ok = false;
   if (h.startsWith("Basic ")) {
-    let cred;
-    try { cred = atob(h.slice(5)).split(":"); } catch {}
-    ok = !!cred && cred[0] === c.user && cred[1] === c.pass;
+    let raw = null;
+    try { raw = atob(h.slice(5)); } catch {}
+    if (raw !== null) {
+      const i = raw.indexOf(":");   // 按第一个冒号切分, 密码里含冒号也能正确比对
+      ok = i >= 0 && raw.slice(0, i) === c.user && raw.slice(i + 1) === c.pass;
+    }
   }
   if (ok) { bf.delete(ip); return true; }
   e.t = now;
@@ -544,12 +572,8 @@ async function handleApi(request, env, url, ctx) {
   const path = url.pathname;
 
   if (path === "/health") {
-    let cat = null;
-    try { cat = await getCatalog(env); } catch (e) { cat = { error: String(e).slice(0, 120) }; }
-    return json({
-      ok: true, configured: await isConfigured(env), colo: request.cf?.colo,
-      catalog: cat ? { generated: cat.generated || "?", mounts: Object.keys(cat.mounts || {}).length } : null,
-    });
+    // 只回状态, 不泄露挂载数/目录时间(要看这些走需认证的 /tree)
+    return json({ ok: true, configured: await isConfigured(env), colo: request.cf?.colo });
   }
 
   if (!(await checkAuth(request, env))) return new Response("401 Unauthorized", {
@@ -664,10 +688,10 @@ const ADMIN_FORM = (origin, info, dav_user, dav_pass) => `
 <h1>139dav 管理页</h1>
 <p class="sub">分享列表管理 · WebDAV 与直链接口同源</p>
 <div class="status">
-WebDAV 地址: <b>` + origin + `/</b>（播放器/rclone 直接挂）<br>
-WebDAV 账号: <b>` + dav_user + `</b>  密码: <b>` + dav_pass + `</b>（忘了就回这里看）<br>
-直链接口: <b>` + origin + `/link?path=/分类/标题/文件.mp4</b><br>
-当前目录: <b>` + info.mounts + `</b> 个挂载（generated ` + (info.generated || "未导入") + `）
+WebDAV 地址: <b>` + xmlEsc(origin) + `/</b>（播放器/rclone 直接挂）<br>
+WebDAV 账号: <b>` + xmlEsc(dav_user) + `</b>  密码: <b>` + xmlEsc(dav_pass) + `</b>（忘了就回这里看）<br>
+直链接口: <b>` + xmlEsc(origin) + `/link?path=/分类/标题/文件.mp4</b><br>
+当前目录: <b>` + xmlEsc(String(info.mounts)) + `</b> 个挂载（generated ` + xmlEsc(info.generated || "未导入") + `）
 </div>
 <label>分享列表（每行一条: <code>分类/标题 | 分享链接或ID#提取码</code>, 链接可多个用逗号分隔; 保存后全量覆盖）</label>
 <textarea id="cat" placeholder="分类/标题 | https://yun.139.com/shareweb/#/w/i/xxxxxx&#10;电影/某电影 | yyyyyyyy,zzzzzzzz#8888"></textarea>
@@ -705,8 +729,24 @@ b2.onclick = async () => {
 function parseLinkEntriesInWorker(raw) {
   return String(raw || "").split(/[,，;；\n]+/).map(s => s.trim()).filter(Boolean).map(s => {
     const m = s.match(/(?:shareweb\/#|w\/#)\/w\/i\/([0-9A-Za-z]+)/) || s.match(/caiyun\.139\.com\/[wm]\/i[/?]([0-9A-Za-z]+)/);
-    let id = m ? m[1] : s, pwd = "";
-    if (id.includes("#")) { const p = id.split("#"); id = p[0]; pwd = p[1] || ""; }
+    let id, pwd = "";
+    if (m) {
+      id = m[1];
+      // 链接后面跟 #提取码 也要认。注意 139 链接本身含 "#"(shareweb/#/w/i/...),
+      // 所以只能看 ID 之后的部分, 不能对整串 split("#")
+      const rest = s.slice(m.index + m[0].length);
+      const h = rest.indexOf("#");
+      if (h >= 0) {
+        // 候选码不能含 / : ? 且不能太长——否则是 markdown [链接](链接) 的后半段 URL
+        const cand = rest.slice(h + 1).split(/[,，;；\s)\]]/)[0].trim();
+        if (cand && cand.length <= 32 && !/[/:?]/.test(cand)) pwd = cand;
+      }
+    } else if (s.includes("#")) {
+      const p = s.split("#");
+      id = p[0].trim(); pwd = (p[1] || "").trim();
+    } else {
+      id = s;
+    }
     return pwd ? id + "#" + pwd : id;
   }).filter(Boolean);
 }
@@ -727,7 +767,6 @@ async function handleSetup(request, env, url) {
     let b;
     try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
     let auth = String(b.auth || "").trim().replace(/^Basic\s+/i, "");
-    const dav_pass = String(b.dav_pass || "");
     if (!auth) return json({ error: "Authorization 不能为空" }, 400);
     let account = String(b.account || "").trim();
     let dec = "";
@@ -736,10 +775,18 @@ async function handleSetup(request, env, url) {
     if (parts.length < 3) return json({ error: "Authorization 格式不对, 应为 pc:手机号:令牌" }, 400);
     if (!account) account = parts[1] || "";
     if (!/^\d{5,15}$/.test(account)) return json({ error: "账号识别失败, 请手动填写手机号" }, 400);
+    const old = await getConfig(env);
+    // 留空 = 不修改(管理页就是这么标注的); 首次配置必须填
+    let dav_pass = String(b.dav_pass || "");
+    if (!dav_pass) {
+      if (!configured || !old.dav_pass) return json({ error: "WebDAV 密码至少 6 位" }, 400);
+      dav_pass = old.dav_pass;
+    }
     if (dav_pass.length < 6) return json({ error: "WebDAV 密码至少 6 位" }, 400);
-    const dav_user = String(b.dav_user || "admin").trim() || "admin";
+    const dav_user = String(b.dav_user || old.dav_user || "admin").trim() || "admin";
     await env.CACHE.put("config", JSON.stringify({ auth: auth, account: account, dav_user: dav_user, dav_pass: dav_pass }));
     globalThis.__cfg = null;
+    globalThis.__auth = null;   // 令牌可能变了, 让 getAuth 重新读
     return json({ ok: true });
   }
   return text("405", 405);

@@ -4,6 +4,4 @@ __pycache__/
 .deploy_meta.json
 # 生成物不入库
 catalog.json
-shares_cleaned.yaml
-out/
 tmdb_cache.json

@@ -41,6 +41,7 @@ const CAT_TTL = 60;          // catalog 内存缓存 60 秒【秒】—— 比�
 const LIST_PAGE = 200;       // 139 分享列表单页条数(接口默认只给 100, 必须显式翻页)
 const LIST_MAX_PAGES = 100;  // 翻页安全上限: 100 页 × 200 = 20000 项
 const CACHE_V = "v2";        // 目录缓存键版本; 列目录结构变更时递增, 让旧缓存立即失效
+const REALM = "139dav";      // Basic 认证 realm; 必须四处统一, 否则浏览器按 realm 分开缓存凭据
 const WARM_BATCH = 8;        // 每次定时预热处理的挂载数(只补缺; 免费版单次请求 50 子请求上限, 不宜调大)
 const WARM_CALL_BUDGET = 25; // 预热时 139 API 调用预算(免费版单次请求 50 子请求上限)
 const WARM_DAILY_CAP = 2000; // 每日预热调用上限(保护账号, 避免触发风控)
@@ -416,12 +417,18 @@ async function listMountRoot(env, members, ctx, opts = {}) {
 
 async function getDlUrl(env, members, entry) {
   const member = members[entry.memberIdx || 0];
-  const key = `dl:${member.id}:${entry.id}`;
+  const account = (await getConfig(env)).account;
+  // 缓存键带上账号和提取码指纹: 否则换 139 账号、或同一分享改了提取码后,
+  // 10 分钟内还会复用旧直链
+  const pw = member.pwd || "";
+  let pwTag = 0;
+  for (let i = 0; i < pw.length; i++) pwTag = (pwTag * 31 + pw.charCodeAt(i)) | 0;
+  const key = `dl:${account}:${member.id}:${pwTag}:${entry.id}`;
   const kv = await env.CACHE.get(key);
   if (kv) { try { const j = JSON.parse(kv); if (j.url) return j.url; } catch {} }
   const body = await call139(env, API.DL, {
     dlFromOutLinkReqV3: {
-      account: (await getConfig(env)).account, linkID: member.id, passwd: member.pwd,
+      account, linkID: member.id, passwd: member.pwd,
       coIDLst: { item: [entry.id] },
     },
   });
@@ -521,19 +528,19 @@ function multistatus(responses) {
 const naturalCmp = (a, b) => a.name.localeCompare(b.name, "zh", { numeric: true, sensitivity: "base" });
 
 async function handleDav(request, env, url, ctx) {
-  if (!(await checkAuth(request, env))) return new Response("401 Unauthorized", {
-    status: 401, headers: { "WWW-Authenticate": 'Basic realm="cloud139"', "Content-Type": "text/plain" },
-  });
-  const segs = url.pathname.replace(/^\/+|\/+$/g, "").split("/").map(s => {
-    try { return decodeURIComponent(s); } catch { return s; }
-  }).filter(Boolean);
-
+  // OPTIONS 放在认证之前: 浏览器类 WebDAV 客户端的 CORS 预检不带凭据, 先认证会 401
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: {
       DAV: "1", Allow: "OPTIONS, GET, HEAD, PROPFIND",
       "MS-Author-Via": "DAV", "Content-Length": "0",
     } });
   }
+  if (!(await checkAuth(request, env))) return new Response("401 Unauthorized", {
+    status: 401, headers: { "WWW-Authenticate": `Basic realm="${REALM}"`, "Content-Type": "text/plain" },
+  });
+  const segs = url.pathname.replace(/^\/+|\/+$/g, "").split("/").map(s => {
+    try { return decodeURIComponent(s); } catch { return s; }
+  }).filter(Boolean);
 
   if (request.method === "PROPFIND") {
     const depth = (request.headers.get("Depth") || "1").trim();
@@ -547,7 +554,8 @@ async function handleDav(request, env, url, ctx) {
     let selfMtime = Date.parse(cat.generated || "") || Date.now();
     let entries = [];
     // 文件没有子项, 直接返回自身(省掉一次拿文件 ID 当目录去列的 139 调用)
-    if (resolved.kind !== "file" && (resolved.kind !== "catdir" || depth !== "0")) {
+    // Depth:0 只要资源自身属性, 别为它去把整个目录拉一遍(白耗 139 配额)
+    if (resolved.kind !== "file" && depth !== "0") {
       entries = await dirEntries(env, resolved, ctx, cat);
     }
     if (entries.length) {
@@ -604,7 +612,11 @@ async function checkAuth(request, env) {
   const ip = request.headers.get("CF-Connecting-IP") || "unknown";
   const bf = (globalThis.__bf ||= new Map());
   const now = Date.now();
-  if (bf.size > 500) for (const [k, v] of bf) if (now - (v.t || 0) > BF_WINDOW) bf.delete(k);
+  // 清理过期条目: 每分钟最多扫一次, 避免每个请求都 O(n) 遍历整张表
+  if (bf.size > 64 && now - (globalThis.__bfClean || 0) > 60e3) {
+    globalThis.__bfClean = now;
+    for (const [k, v] of bf) if (now - (v.t || 0) > BF_WINDOW) bf.delete(k);
+  }
   let e = bf.get(ip);
   if (!e) { e = { n: 0, t: now }; bf.set(ip, e); }
   if (e.locked && now < e.locked) return false;                    // 锁定中, 直接拒
@@ -647,7 +659,7 @@ async function handleApi(request, env, url, ctx) {
   }
 
   if (!(await checkAuth(request, env))) return new Response("401 Unauthorized", {
-    status: 401, headers: { "WWW-Authenticate": 'Basic realm="cloud139"', "Content-Type": "text/plain" },
+    status: 401, headers: { "WWW-Authenticate": `Basic realm="${REALM}"`, "Content-Type": "text/plain" },
   });
 
   if (path === "/link") {
@@ -821,7 +833,7 @@ async function handleSetup(request, env, url) {
   if (request.method === "GET") {
     if (configured && !(await checkAuth(request, env))) {
       return new Response("401 Unauthorized（已配置, 修改请用管理账号登录）", {
-        status: 401, headers: { "WWW-Authenticate": 'Basic realm="139dav"', "Content-Type": "text/plain" } });
+        status: 401, headers: { "WWW-Authenticate": `Basic realm="${REALM}"`, "Content-Type": "text/plain" } });
     }
     return page("初始配置", SETUP_FORM(configured ? '<p class="hint ok">已配置过, 再次提交将覆盖现有配置。</p>' : ""));
   }
@@ -867,7 +879,7 @@ async function handleAdminUi(request, env, url) {
   if (request.method !== "GET") return text("405", 405);
   if (!(await checkAuth(request, env))) {
     return new Response("401 Unauthorized", {
-      status: 401, headers: { "WWW-Authenticate": 'Basic realm="139dav"', "Content-Type": "text/plain" } });
+      status: 401, headers: { "WWW-Authenticate": `Basic realm="${REALM}"`, "Content-Type": "text/plain" } });
   }
   let info = { mounts: 0, generated: null };
   try { const c = await getCatalog(env); info = { mounts: Object.keys(c.mounts || {}).length, generated: c.generated }; } catch {}
@@ -910,19 +922,23 @@ async function warmMounts(env, ctx) {
   if (Number(await env.CACHE.get(dayKey) || 0) >= WARM_DAILY_CAP) return; // 当日配额用尽
   let idx = Number(await env.CACHE.get("warm_idx") || 0);
   if (!Number.isFinite(idx) || idx < 0 || idx >= keys.length) idx = 0;
-  globalThis.__callCount = 0;
+  // 用"增量"而不是把全局计数清零: 清零会抹掉并发用户请求的计数,
+  // 预算改成 base + 上限, 判定与每日配额都用增量
+  const base = globalThis.__callCount || 0;
+  const budget = base + WARM_CALL_BUDGET;
   let n = 0;
   for (; idx < keys.length && n < WARM_BATCH; idx++, n++) {
     const members = parseMembers(cat.mounts[keys[idx]]);
     if (!members.length) continue;
     // 预算透传给 listAll, 翻页过程中就会停(不会先打完 100 次再检查)
-    try { await listMountRoot(env, members, ctx, { fillOnly: true, budget: WARM_CALL_BUDGET }); } catch {}
-    if (globalThis.__callCount >= WARM_CALL_BUDGET) { idx++; break; }
+    try { await listMountRoot(env, members, ctx, { fillOnly: true, budget }); } catch {}
+    if ((globalThis.__callCount || 0) >= budget) { idx++; break; }
   }
   await env.CACHE.put("warm_idx", String(idx >= keys.length ? 0 : idx));
-  if (globalThis.__callCount > 0) {
+  const used = (globalThis.__callCount || 0) - base;
+  if (used > 0) {
     const cur = Number(await env.CACHE.get(dayKey) || 0);
-    await env.CACHE.put(dayKey, String(cur + globalThis.__callCount), { expirationTtl: 172800 });
+    await env.CACHE.put(dayKey, String(cur + used), { expirationTtl: 172800 });
   }
 }
 

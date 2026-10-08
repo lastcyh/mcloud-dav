@@ -61,7 +61,8 @@ def decrypt_payload(text):
     cipher = AES.new(AES_KEY, AES.MODE_CBC, raw[:16])
     data = cipher.decrypt(raw[16:])
     pad = data[-1]
-    return json.loads(data[:-pad].decode("utf-8", "replace"))
+    # pad 为 0 时 data[:-0] 会变成空 bytes(合法的 PKCS7 不会是 0, 这里只是防御)
+    return json.loads((data[:-pad] if pad else data).decode("utf-8", "replace"))
 
 
 ID_RE = re.compile(

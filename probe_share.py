@@ -92,12 +92,20 @@ def main():
     lid, pwd = parse_link(args.link)
     print(f"分享ID: {lid}  提取码: {pwd or '(无)'}\n")
 
-    # 1) 列分享根目录
-    resp = post(LIST_URL, {"getOutLinkInfoReq": {
-        "account": args.account, "linkID": lid, "passwd": pwd, "pCaID": "root"}}, args.auth)
-    data = resp.get("data") or {}
-    folders = data.get("caLst") or []
-    files = data.get("coLst") or []
+    # 1) 列分享根目录（分页拉全量：单页最多 200，不翻页只会拿到前 100）
+    folders, files = [], []
+    for page in range(100):
+        b = page * 200 + 1
+        resp = post(LIST_URL, {"getOutLinkInfoReq": {
+            "account": args.account, "linkID": lid, "passwd": pwd, "pCaID": "root",
+            "caSrt": 1, "coSrt": 1, "srtDr": 0, "bNum": b, "eNum": b + 199}}, args.auth)
+        data = resp.get("data") or {}
+        ca = data.get("caLst") or []
+        co = data.get("coLst") or []
+        folders += ca
+        files += co
+        if len(ca) + len(co) < 200:
+            break
     print(f"[列表接口] 成功: 根目录 {len(folders)} 个文件夹, {len(files)} 个文件")
     for f in folders[:10]:
         print(f"    [目录] {f.get('caName')}  (caID={f.get('caID')})")

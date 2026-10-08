@@ -38,6 +38,9 @@ const BF_MAX = 5;            // 连续失败 N 次锁定
 const BF_WINDOW = 600e3;     // 失败计数窗口 10 分钟
 const BF_LOCK_TTL = 900e3;   // 锁定 15 分钟(内存级, 个人使用的轻量防护)
 const CAT_TTL = 600;         // catalog 内存缓存 10 分钟
+const LIST_PAGE = 200;       // 139 分享列表单页条数(接口默认只给 100, 必须显式翻页)
+const LIST_MAX_PAGES = 100;  // 翻页安全上限: 100 页 × 200 = 20000 项
+const CACHE_V = "v2";        // 目录缓存键版本; 列目录结构变更时递增, 让旧缓存立即失效
 const WARM_BATCH = 40;       // 每次定时预热处理的挂载数(只补缺, 已缓存的零成本跳过)
 const WARM_CALL_BUDGET = 25; // 预热时 139 API 调用预算(免费版单次请求 50 子请求上限)
 const WARM_DAILY_CAP = 2000; // 每日预热调用上限(保护账号, 避免触发风控)
@@ -267,13 +270,46 @@ async function cachedListing(env, key, recompute, ctx, opts = {}) {
   return d;
 }
 
-async function listOne(env, member, pcaid, ctx, opts = {}) {
-  return cachedListing(env, `lst:${member.id}:${member.pwd}:${pcaid}`, async () => {
+// 列一个分享目录的全部内容。
+// 139 getOutLinkInfoV6 不传分页参数时只返回前 100 项(按最近添加排序),
+// 因此必须用 bNum/eNum 逐页拉取(单页上限 200), 并用 caSrt/coSrt/srtDr 固定排序保证翻页稳定。
+async function listAll(env, member, pcaid) {
+  const account = (await getConfig(env)).account;
+  const folders = [];
+  const files = [];
+  const seen = new Set();
+  for (let page = 0; page < LIST_MAX_PAGES; page++) {
+    const bNum = page * LIST_PAGE + 1;
     const body = await call139(env, API.LIST, {
-      getOutLinkInfoReq: { account: (await getConfig(env)).account, linkID: member.id, passwd: member.pwd, pCaID: pcaid },
+      getOutLinkInfoReq: {
+        account, linkID: member.id, passwd: member.pwd, pCaID: pcaid,
+        caSrt: 1, coSrt: 1, srtDr: 0,          // 固定排序, 避免翻页时顺序漂移导致漏项/重复
+        bNum, eNum: bNum + LIST_PAGE - 1,      // 页码区间, 闭区间 1-based
+      },
     });
-    return normListing(body);
-  }, ctx, opts);
+    const d = body?.data || {};
+    const ca = d.caLst || [];
+    const co = d.coLst || [];
+    let fresh = 0;
+    for (const f of ca) {
+      if (!f.caID || seen.has(f.caID)) continue;
+      seen.add(f.caID); fresh++;
+      folders.push({ kind: "dir", id: f.caID, name: f.caName, mtime: parseMtime(f.udTime) });
+    }
+    for (const f of co) {
+      if (!f.coID || seen.has(f.coID)) continue;
+      seen.add(f.coID); fresh++;
+      files.push({ kind: "file", id: f.coID, name: f.coName, size: Number(f.coSize || 0), mtime: parseMtime(f.udTime) });
+    }
+    // 本页不足一页(或没有新条目) => 已到最后一页
+    if (ca.length + co.length < LIST_PAGE || fresh === 0) break;
+  }
+  return { folders, files };
+}
+
+async function listOne(env, member, pcaid, ctx, opts = {}) {
+  return cachedListing(env, `lst:${CACHE_V}:${member.id}:${member.pwd}:${pcaid}`,
+    async () => listAll(env, member, pcaid), ctx, opts);
 }
 
 // 列单个成员的"有效根": 若根目录只有一个文件夹(分享者套壳)则自动下沉, 最多 3 层
@@ -288,7 +324,7 @@ async function listMemberRoot(env, member, ctx, opts = {}) {
 }
 
 async function listMountRoot(env, members, ctx, opts = {}) {
-  const key = `lst:${members.map(m => `${m.id}|${m.pwd}`).join(",")}:@root`;
+  const key = `lst:${CACHE_V}:${members.map(m => `${m.id}|${m.pwd}`).join(",")}:@root`;
   return cachedListing(env, key, async () => {
     const merged = { folders: [], files: [] };
     const seen = new Set();

@@ -227,14 +227,6 @@ function parseMtime(s) {
   return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 8, +m[5], +m[6]); // 北京时间
 }
 
-function normListing(body) {
-  const d = body?.data || {};
-  return {
-    folders: (d.caLst || []).map(f => ({ kind: "dir", id: f.caID, name: f.caName, mtime: parseMtime(f.udTime) })),
-    files: (d.coLst || []).map(f => ({ kind: "file", id: f.coID, name: f.coName, size: Number(f.coSize || 0), mtime: parseMtime(f.udTime) })),
-  };
-}
-
 function memoSet(key, data) {
   globalThis.__dirs = globalThis.__dirs || new Map();
   globalThis.__dirs.set(key, { data, ts: Date.now() });
@@ -244,11 +236,16 @@ function memoSet(key, data) {
 // 最长保留 7 天, 超龄才同步重新拉取
 async function cachedListing(env, key, recompute, ctx, opts = {}) {
   const now = Date.now();
+  // 后台静默刷新: 内存 memo 和 KV 都要更新。
+  // 只写 memo 不写 KV 的话, KV 里的 t 永远不变, 冷启动会一直读到旧数据(最长 DIR_STORE),
+  // 而且每个超过新鲜期的请求都会再触发一次全量重拉, 白白消耗 139 配额。
+  const refresh = () => recompute().then(async d => {
+    memoSet(key, d);
+    await env.CACHE.put(key, JSON.stringify({ d, t: Date.now() }), { expirationTtl: DIR_STORE });
+  }).catch(() => {});
   const memo = globalThis.__dirs?.get(key);
   if (memo && now - memo.ts < DIR_STORE * 1000) {
-    if (!opts.fillOnly && now - memo.ts > DIR_FRESH && ctx?.waitUntil) {
-      ctx.waitUntil(recompute().then(d => memoSet(key, d)).catch(() => {}));
-    }
+    if (!opts.fillOnly && now - memo.ts > DIR_FRESH && ctx?.waitUntil) ctx.waitUntil(refresh());
     return memo.data;
   }
   const kv = await env.CACHE.get(key);
@@ -257,9 +254,7 @@ async function cachedListing(env, key, recompute, ctx, opts = {}) {
       const j = JSON.parse(kv);
       if (j && j.d && now - (j.t || 0) < DIR_STORE * 1000) {
         memoSet(key, j.d);
-        if (!opts.fillOnly && now - (j.t || 0) > DIR_FRESH && ctx?.waitUntil) {
-          ctx.waitUntil(recompute().then(d => memoSet(key, d)).catch(() => {}));
-        }
+        if (!opts.fillOnly && now - (j.t || 0) > DIR_FRESH && ctx?.waitUntil) ctx.waitUntil(refresh());
         return j.d;
       }
     } catch {}
@@ -332,8 +327,9 @@ async function listMountRoot(env, members, ctx, opts = {}) {
       const one = await listMemberRoot(env, members[mi], ctx, opts);
       for (const arr of [one.folders, one.files]) {
         for (const e of arr) {
-          if (seen.has(e.name)) continue;   // 同名先到先得
-          seen.add(e.name);
+          const k = e.kind + ":" + e.name;   // 按 类型+名字 去重, 避免同名文件与文件夹互相顶掉
+          if (seen.has(k)) continue;         // 同名先到先得
+          seen.add(k);
           merged[e.kind === "dir" ? "folders" : "files"].push({ ...e, memberIdx: mi });
         }
       }
@@ -463,13 +459,16 @@ async function handleDav(request, env, url, ctx) {
     // 目录 mtime = catalog 重建时间 与 内容最新修改时间 的较大者
     let selfMtime = Date.parse(cat.generated || "") || Date.now();
     let entries = [];
-    if (resolved.kind !== "catdir" || depth !== "0") {
+    // 文件没有子项, 直接返回自身(省掉一次拿文件 ID 当目录去列的 139 调用)
+    if (resolved.kind !== "file" && (resolved.kind !== "catdir" || depth !== "0")) {
       entries = await dirEntries(env, resolved, ctx, cat);
     }
     if (entries.length) {
       selfMtime = Math.max(selfMtime, ...entries.map(e => e.mtime || 0));
     }
-    const self = { kind: "dir", name: segs[segs.length - 1] || "", size: 0, mtime: selfMtime };
+    const self = resolved.kind === "file"
+      ? { kind: "file", name: segs[segs.length - 1] || "", size: resolved.entry.size || 0, mtime: resolved.entry.mtime || 0 }
+      : { kind: "dir", name: segs[segs.length - 1] || "", size: 0, mtime: selfMtime };
     const out = [davResponse(hrefOf(segs), self, segs.length === 0)];
     if (depth !== "0") {
       entries.sort((a, b) => (a.kind === b.kind ? naturalCmp(a, b) : a.kind === "dir" ? -1 : 1));
@@ -513,7 +512,7 @@ async function getDavCreds(env) {
   return { user: c.dav_user, pass: c.dav_pass };
 }
 
-// 认证 + 防爆破: 连续失败 N 次锁定该 IP 15 分钟(写入 KV 跨隔离生效), 失败加随机延迟
+// 认证 + 防爆破: 同一 IP 连续失败 N 次锁定 15 分钟(内存级, 跨 isolate 不共享), 失败加随机延迟
 async function checkAuth(request, env) {
   const ip = request.headers.get("CF-Connecting-IP") || "unknown";
   const bf = (globalThis.__bf ||= new Map());
@@ -600,10 +599,7 @@ async function handleApi(request, env, url, ctx) {
     if (m) lid = m[1];
     if (lid.includes("#")) [lid, pwd] = lid.split("#", 2);
     const t0 = Date.now();
-    const r = await call139(env, API.LIST, {
-      getOutLinkInfoReq: { account: (await getConfig(env)).account, linkID: lid, passwd: pwd, pCaID: "root" },
-    });
-    const d = normListing(r);
+    const d = await listAll(env, { id: lid, pwd }, "root");
     return json({ share: lid, ms: Date.now() - t0, folders: d.folders.map(f => f.name), files: d.files.map(f => f.name) });
   }
 
